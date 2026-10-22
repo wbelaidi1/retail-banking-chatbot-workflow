@@ -1,0 +1,8 @@
+[project]
+name = "retail-banking-chatbot-workflow"
+version = "0.1.0"
+description = "Multi-agent retail banking chatbot as a Mistral conversational Workflow"
+requires-python = ">=3.12"
+dependencies = [
+    "mistralai-workflows[mistralai]>=3.10",
+]
