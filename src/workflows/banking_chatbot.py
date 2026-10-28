@@ -64,30 +64,31 @@ def _text(inp) -> str:
     return "".join(c.text for c in (inp.message or [])) if inp and inp.message else ""
 
 
+def resolve_user(user_id: str) -> str:
+    """Map any user_id to a known demo profile instead of failing."""
+    return user_id if user_id in BANK_DB["customers"] else "demo"
+
+
 # ---------------------------------------------------------------------------
 # Tool layer — deterministic activities (least privilege: each tool does one thing)
 # ---------------------------------------------------------------------------
 @workflows.activity()
 async def fetch_balances(user_id: str) -> list:
-    customer = BANK_DB["customers"].get(user_id)
-    if not customer:
-        raise ValueError(f"Unknown customer: {user_id}")
+    customer = BANK_DB["customers"].get(resolve_user(user_id))
     return customer["accounts"]
 
 
 @workflows.activity()
 async def fetch_cards(user_id: str) -> list:
-    customer = BANK_DB["customers"].get(user_id)
-    if not customer:
-        raise ValueError(f"Unknown customer: {user_id}")
+    customer = BANK_DB["customers"].get(resolve_user(user_id))
     return [{"id": cid, **card} for cid, card in customer["cards"].items()]
 
 
 @workflows.activity()
 async def set_card_status(user_id: str, card_id: str, locked: bool) -> dict:
     """Tool call to the (mock) Card API. Idempotent and reversible."""
-    customer = BANK_DB["customers"].get(user_id)
-    if not customer or card_id not in customer["cards"]:
+    customer = BANK_DB["customers"].get(resolve_user(user_id))
+    if card_id not in customer["cards"]:
         raise ValueError("Card not found for this customer")
     customer["cards"][card_id]["locked"] = locked
     return {"id": card_id, **customer["cards"][card_id]}
@@ -127,8 +128,14 @@ class RetailBankingChatbotWorkflow(workflows.InteractiveWorkflow):
     @workflows.workflow.entrypoint
     async def run(self, input: ChatbotInput) -> workflows_mistralai.ChatAssistantWorkflowOutput:
         user_id = input.user_id
-        customer = BANK_DB["customers"].get(user_id)
-        first_name = customer["name"].split()[0] if customer else "there"
+        if user_id not in BANK_DB["customers"]:
+            await workflows_mistralai.send_assistant_message(
+                f"No test profile for '{user_id}' in this prototype — continuing with the "
+                "demo customer (Sophie Martin)."
+            )
+            user_id = "demo"
+        customer = BANK_DB["customers"][user_id]
+        first_name = customer["name"].split()[0]
 
         await workflows_mistralai.send_assistant_message(
             f"Hello {first_name}! I'm your BNP banking assistant. I can answer FAQs "
@@ -184,7 +191,7 @@ class RetailBankingChatbotWorkflow(workflows.InteractiveWorkflow):
 
     # --- FAQ Agent: LLM grounded on the curated knowledge base ---
     async def _faq_agent(self, user_id: str, question: str) -> None:
-        customer = BANK_DB["customers"].get(user_id, {})
+        customer = BANK_DB["customers"].get(resolve_user(user_id), {})
         try:
             session = workflows_mistralai.RemoteSession(stream=True)
             faq_agent = workflows_mistralai.Agent(
