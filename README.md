@@ -29,3 +29,24 @@ Input: { "user_id": "demo" } then chat. Example requests:
 - "Lock my credit card" (demo OTP: 123456)
 
 Note: the banking store is in-memory for the prototype — card locks reset on worker restart. Swap the activities for real Core Banking API calls in production.
+
+## Standalone chat UI + log/trace viewer (`ui/`)
+
+Besides Vibe Work and Studio, you can chat with the **same deployed workflow** from a local web UI, and browse its logs and OpenTelemetry trace in your own viewer — no Studio needed.
+
+```bash
+pip install -r ui/requirements.txt
+export MISTRAL_API_KEY=...        # same key/console project as the deployment
+uvicorn ui.app:app --reload --port 8000   # run from the repo root
+```
+
+- **http://localhost:8000** — chat UI. Starts a real execution, streams the assistant's messages, shows suggestion chips and the OTP/confirmation flows.
+- **http://localhost:8000/logs** — log viewer. Per execution: lifecycle + assistant-message events, worker logs, and the execution's OTel spans with a small timeline.
+
+### How it works
+
+- The chat UI drives the managed deployment through the public Workflows API: `execute_workflow` to start, the `__get_pending_inputs` query to discover what the workflow is waiting for, and the `__submit_input` update to send each user message — the same protocol Vibe Work uses.
+- Instead of redirecting OTLP from the worker (not reachable when the worker is managed by Mistral), the UI pulls each execution's OpenTelemetry trace from the platform (`GET /v1/workflows/executions/{id}/trace/otel`) plus its logs and event history, and stores everything in a local SQLite database (`ui/data/ui.db`, git-ignored). The `/logs` page reads only from SQLite.
+- If you later self-host the worker, you can additionally point its standard OpenTelemetry exporter (`OTEL_EXPORTER_OTLP_ENDPOINT`) at a local collector (e.g. Jaeger all-in-one) for real-time OTLP; the SQLite capture here keeps working unchanged.
+
+Configuration (env vars): `MISTRAL_API_KEY` (required), `WORKFLOW_NAME` (default `retail-banking-chatbot`), `UI_DB_PATH` (SQLite location), `UI_POLL_SECONDS`.

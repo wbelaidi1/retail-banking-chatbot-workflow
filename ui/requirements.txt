@@ -1,0 +1,5 @@
+# Standalone chat UI + log/trace viewer for the retail-banking-chatbot workflow.
+# (The workflow worker itself only needs the repo's main pyproject dependencies.)
+mistralai>=1.0.0
+fastapi>=0.110
+uvicorn[standard]>=0.29
