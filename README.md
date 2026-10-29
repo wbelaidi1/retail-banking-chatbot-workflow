@@ -36,7 +36,7 @@ Besides Vibe Work and Studio, you can chat with the **same deployed workflow** f
 
 ```bash
 pip install -r ui/requirements.txt
-export MISTRAL_API_KEY=...        # same key/console project as the deployment
+echo "MISTRAL_API_KEY=..." > .env  # key from the same console project as the deployment (.env is git-ignored)
 uvicorn ui.app:app --reload --port 8000   # run from the repo root
 ```
 

@@ -9,7 +9,7 @@ it starts executions, reads pending inputs, submits user messages, and
 captures logs / events / the OpenTelemetry trace for each execution.
 
 Run (from the repo root):
-    export MISTRAL_API_KEY=...
+    echo MISTRAL_API_KEY=... > .env     # or export MISTRAL_API_KEY=...
     uvicorn ui.app:app --reload --port 8000
 
 Then open http://localhost:8000 (chat) and http://localhost:8000/logs (logs).
@@ -31,11 +31,18 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from mistralai import Mistral
+from dotenv import load_dotenv
+try:
+    from mistralai.client import Mistral  # mistralai >= 2
+except ImportError:
+    from mistralai import Mistral  # mistralai 1.x
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+# Reads <repo root>/.env (git-ignored); real environment variables take precedence.
+load_dotenv(os.path.join(os.path.dirname(__file__), os.pardir, ".env"))
+
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY")
 WORKFLOW_NAME = os.environ.get("WORKFLOW_NAME", "retail-banking-chatbot")
 DB_PATH = os.environ.get("UI_DB_PATH", os.path.join(os.path.dirname(__file__), "data", "ui.db"))
@@ -166,13 +173,29 @@ def _iter_event_dicts(node: Any) -> Iterator[Dict[str, Any]]:
             yield from _iter_event_dicts(v)
 
 
+def _fetch_events(client: Mistral, execution_id: str) -> List[Dict[str, Any]]:
+    """All platform events of an execution (assistant_message, wait_for_input, lifecycle), in order."""
+    events: List[Dict[str, Any]] = []
+    cursor = None
+    while True:
+        resp = _to_dict(
+            client.workflows.events.get_workflow_events(
+                workflow_exec_id=execution_id, limit=500, cursor=cursor
+            )
+        )
+        events.extend(resp.get("events") or [])
+        cursor = resp.get("next_cursor")
+        if not cursor:
+            return events
+
+
 def _event_fields(event: Dict[str, Any]) -> Dict[str, Any]:
     attrs = event.get("attributes") or event
     out = {
         "event_id": event.get("event_id") or attrs.get("event_id"),
         "event_type": event.get("event_type") or attrs.get("event_type"),
-        "ts_ns": event.get("event_timestamp_ns") or attrs.get("event_timestamp_ns"),
-        "run_id": event.get("run_id") or attrs.get("run_id"),
+        "ts_ns": event.get("event_timestamp") or event.get("event_timestamp_ns"),
+        "run_id": event.get("workflow_run_id") or event.get("run_id"),
     }
     out["task_type"] = attrs.get("custom_task_type")
     payload = _unwrap_payload(attrs.get("payload"))
@@ -239,10 +262,7 @@ def _sync_execution(execution_id: str) -> Dict[str, Any]:
         new_messages: List[Dict[str, Any]] = []
         last_event_id: Optional[str] = None
         try:
-            history = client.workflows.executions.get_workflow_execution_history(
-                execution_id=execution_id, decode_payloads=True
-            )
-            history = _to_dict(_unwrap_payload(history))
+            history = _fetch_events(client, execution_id)
         except Exception:
             history = None
         if history:
@@ -259,7 +279,7 @@ def _sync_execution(execution_id: str) -> Dict[str, Any]:
                 last_event_id = f["event_id"] or last_event_id
                 if f["event_type"] not in ("CUSTOM_TASK_STARTED", "CUSTOM_TASK_COMPLETED"):
                     continue
-                if f["task_type"] == "assistant_message" and f["event_type"] == "CUSTOM_TASK_STARTED":
+                if f["task_type"] == "assistant_message" and f["event_type"] == "CUSTOM_TASK_COMPLETED":
                     text = _assistant_text(f["payload"])
                     if text:
                         new_messages.append({"role": "assistant", "text": text})
@@ -327,7 +347,7 @@ def _sync_execution(execution_id: str) -> Dict[str, Any]:
                 execution_id=execution_id, limit=100, order="asc"
             )
             logs_resp = _to_dict(logs_resp)
-            for lg in (logs_resp or {}).get("logs") or []:
+            for lg in (logs_resp or {}).get("results") or (logs_resp or {}).get("logs") or []:
                 if not isinstance(lg, dict):
                     continue
                 with _db() as conn:
@@ -337,7 +357,7 @@ def _sync_execution(execution_id: str) -> Dict[str, Any]:
                         (
                             execution_id,
                             lg.get("timestamp") or "",
-                            lg.get("severity") or "INFO",
+                            lg.get("severity_text") or lg.get("severity") or "INFO",
                             lg.get("body") or "",
                         ),
                     )
@@ -360,8 +380,8 @@ def _sync_execution(execution_id: str) -> Dict[str, Any]:
                            VALUES (?, ?, ?, ?, ?, ?, ?)""",
                         (
                             execution_id,
-                            span.get("spanID") or span.get("span_id"),
-                            span.get("parentSpanID") or span.get("parent_span_id"),
+                            span.get("spanId") or span.get("spanID") or span.get("span_id"),
+                            span.get("parentSpanId") or span.get("parentSpanID") or span.get("parent_span_id"),
                             span.get("name"),
                             str(span.get("startTimeUnixNano") or span.get("start_time_unix_nano") or ""),
                             _duration_ms(span),
@@ -402,7 +422,7 @@ def _iter_spans(trace: Any) -> Iterator[Dict[str, Any]]:
     """Extract OTLP span dicts from a Tempo GetTraceResponse-like structure."""
     def walk(node: Any) -> None:
         if isinstance(node, dict):
-            if "spanID" in node or "span_id" in node:
+            if "spanId" in node or "spanID" in node or "span_id" in node:
                 yield_from_spans.append(node)
                 return
             for v in node.values():
@@ -418,6 +438,13 @@ def _iter_spans(trace: Any) -> Iterator[Dict[str, Any]]:
 
 def _duration_ms(span: Dict[str, Any]) -> Optional[float]:
     d = span.get("durationNanos") or span.get("duration_nanos")
+    if d is None:
+        start = span.get("startTimeUnixNano") or span.get("start_time_unix_nano")
+        end = span.get("endTimeUnixNano") or span.get("end_time_unix_nano")
+        try:
+            d = int(end) - int(start)
+        except (TypeError, ValueError):
+            d = None
     if d is not None:
         try:
             return float(d) / 1e6
